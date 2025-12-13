@@ -4,8 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
-import android.util.Log
-import android.widget.Toast
+import android.widget.Button
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -16,27 +16,47 @@ import com.google.ar.core.Session
 class MainActivity : AppCompatActivity() {
 
     private lateinit var surfaceView: GLSurfaceView
-    private var arCoreSession: Session? = null
-    // On garde le même nom de fichier Renderer pour simplifier, 
-    // mais il va afficher des points maintenant.
-    private val renderer = DepthRenderer(this)
+    private lateinit var tvInfo: TextView
+    private lateinit var btnShoot: Button
 
+    private var arCoreSession: Session? = null
+    private val renderer = ARRenderer(this)
     private val CAMERA_PERMISSION_CODE = 100
-    private val TAG = "PiinkProto_Main"
+    private var isRunning = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         surfaceView = findViewById(R.id.surfaceview)
-        
+        tvInfo = findViewById(R.id.tvDistance)
+        btnShoot = findViewById(R.id.btnShoot)
+
         surfaceView.preserveEGLContextOnPause = true
         surfaceView.setEGLContextClientVersion(2)
         surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         surfaceView.setRenderer(renderer)
         surfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
+        // ACTION DU BOUTON : On dit juste au Renderer "Fais le taf"
+        btnShoot.setOnClickListener {
+            renderer.triggerCapture()
+        }
+
         checkAndRequestCameraPermission()
+    }
+
+    // BOUCLE UI : Met à jour le texte 10 fois par seconde
+    private fun startUiLoop() {
+        Thread {
+            while (isRunning) {
+                try {
+                    Thread.sleep(100)
+                    val msg = renderer.uiMessage
+                    runOnUiThread { tvInfo.text = msg }
+                } catch (e: Exception) { }
+            }
+        }.start()
     }
 
     private fun checkAndRequestCameraPermission() {
@@ -48,52 +68,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == CAMERA_PERMISSION_CODE && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            initializeARCore()
-        } else {
-            Toast.makeText(this, "Permission refusée", Toast.LENGTH_SHORT).show()
-        }
+        if (requestCode == CAMERA_PERMISSION_CODE && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) initializeARCore()
     }
 
     private fun initializeARCore() {
         try {
-            val availability = ArCoreApk.getInstance().checkAvailability(this)
-            if (availability.isSupported) {
+            if (ArCoreApk.getInstance().checkAvailability(this).isSupported) {
                 arCoreSession = Session(this)
-
-                // CONFIGURATION STANDARD (Optimisée pour le Tracking)
                 val config = Config(arCoreSession)
                 config.focusMode = Config.FocusMode.AUTO
-                // On désactive la Depth pour économiser le CPU puisqu'elle ne marche pas
-                config.depthMode = Config.DepthMode.DISABLED 
-                
+                config.depthMode = Config.DepthMode.DISABLED
+                // INSTANT PLACEMENT (Pour les surfaces difficiles)
+                config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
+
                 arCoreSession?.configure(config)
-                
                 renderer.currentSession = arCoreSession
                 arCoreSession?.resume()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Erreur Init", e)
-        }
-    }
 
-    override fun onResume() {
-        super.onResume()
-        surfaceView.onResume()
-        try {
-            arCoreSession?.resume()
+                startUiLoop()
+            }
         } catch (e: Exception) { }
     }
 
-    override fun onPause() {
-        super.onPause()
-        surfaceView.onPause()
-        arCoreSession?.pause()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        arCoreSession?.close()
-    }
+    override fun onResume() { super.onResume(); surfaceView.onResume(); arCoreSession?.resume() }
+    override fun onPause() { super.onPause(); surfaceView.onPause(); arCoreSession?.pause() }
+    override fun onDestroy() { super.onDestroy(); arCoreSession?.close(); isRunning = false }
 }
