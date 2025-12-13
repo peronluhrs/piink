@@ -2,108 +2,120 @@ package com.piink.proto
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.util.Log
-import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.ar.core.ArCoreApk
-import com.google.ar.core.Session
 import com.google.ar.core.Config
+import com.google.ar.core.Session
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var logTextView: TextView
+    private lateinit var surfaceView: GLSurfaceView
     private var arCoreSession: Session? = null
+    // On instancie notre nouveau moteur de rendu
+    private val renderer = DepthRenderer(this)
 
     private val CAMERA_PERMISSION_CODE = 100
-    private val TAG = "PiinkProto_ARCore"
+    private val TAG = "PiinkProto_Main"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        logTextView = findViewById(R.id.logText)
-        logTextView.text = "PIINK TEKNOLOGY - Initialisation ARCore..."
+        surfaceView = findViewById(R.id.surfaceview)
+        
+        // Configuration OpenGL ES 2.0
+        surfaceView.preserveEGLContextOnPause = true
+        surfaceView.setEGLContextClientVersion(2)
+        surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        surfaceView.setRenderer(renderer)
+        // On demande de dessiner en continu
+        surfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
-        // Vérifie la permission et lance ARCore si c'est bon
         checkAndRequestCameraPermission()
     }
 
     private fun checkAndRequestCameraPermission() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA),
-                CAMERA_PERMISSION_CODE
-            )
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE)
         } else {
-            // Permission déjà accordée
             initializeARCore()
         }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == CAMERA_PERMISSION_CODE) {
-            if ((grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED)) {
-                initializeARCore()
-            } else {
-                logTextView.text = "ERREUR: La permission CAMERA est requise pour ARCore."
-            }
+        if (requestCode == CAMERA_PERMISSION_CODE && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            initializeARCore()
+        } else {
+            Toast.makeText(this, "Permission refusée", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun initializeARCore() {
         try {
             val availability = ArCoreApk.getInstance().checkAvailability(this)
-            
-            if (availability.isTransient) {
-                logTextView.text = "Statut ARCore: Temporairement indisponible. Réessaie..."
-                return
-            }
-            
             if (availability.isSupported) {
-                // Création de la session
                 arCoreSession = Session(this)
-                
-                // Configuration de la profondeur
+
+                // --- CORRECTIF 1 : FORCER 30 FPS ---
+                // On crée un filtre pour demander explicitement du 30 FPS
+                val filter = com.google.ar.core.CameraConfigFilter(arCoreSession)
+                filter.targetFps = java.util.EnumSet.of(com.google.ar.core.CameraConfig.TargetFps.TARGET_FPS_30)
+
+                // On récupère la liste des caméras compatibles avec ce filtre
+                val cameraConfigs = arCoreSession?.getSupportedCameraConfigs(filter)
+
+                // Si on en trouve une, on l'applique !
+                if (!cameraConfigs.isNullOrEmpty()) {
+                    Log.i(TAG, "Configuration Caméra forcée à 30 FPS")
+                    arCoreSession?.cameraConfig = cameraConfigs[0]
+                } else {
+                    Log.e(TAG, "Aucune configuration 30 FPS trouvée !")
+                }
+                // ------------------------------------
+
                 val config = Config(arCoreSession)
-                config.depthMode = Config.DepthMode.AUTOMATIC
+
+                // --- CORRECTIF 2 : DÉSACTIVER DEPTH (TEMPORAIRE) ---
+                // Le calcul de profondeur peut tuer les FPS sur certains téléphones.
+                // On le coupe pour tester si le tracking revient.
+                //config.depthMode = Config.DepthMode.DISABLED
+                config.depthMode = Config.DepthMode.AUTOMATIC // Remettre plus tard si tout va bien
+
+                // On s'assure que l'autofocus est activé
+                config.focusMode = Config.FocusMode.AUTO
+
                 arCoreSession?.configure(config)
 
-                logTextView.text = "✅ SUCCÈS : Session ARCore initialisée.\n"
-                logTextView.append("-> Depth Mode configuré sur AUTOMATIC.\n")
-                logTextView.append("-> Le capteur ToF est maintenant piloté par Google ARCore.\n\n")
-                logTextView.append("L'accès 3D est DÉBLOQUÉ.")
-
-            } else {
-                // Version simplifiée pour éviter les erreurs de noms d'enum
-                logTextView.text = "❌ ÉCHEC ARCore: Non supporté (${availability})"
+                // === C'EST ICI QU'ON CONNECTE TOUT ===
+                renderer.currentSession = arCoreSession
+                arCoreSession?.resume()
             }
-
         } catch (e: Exception) {
-            logTextView.text = "❌ ÉCHEC ARCore (Exception):\n${e.message}"
-            Log.e(TAG, "ARCore initialization failed", e)
+            Log.e(TAG, "Erreur Init", e)
         }
     }
-    
-    // Ajout important pour la gestion du cycle de vie ARCore
+
     override fun onResume() {
         super.onResume()
+        surfaceView.onResume()
         try {
             arCoreSession?.resume()
-        } catch (e: Exception) {
-            Log.e(TAG, "Erreur onResume", e)
-        }
+        } catch (e: Exception) { }
     }
 
     override fun onPause() {
         super.onPause()
+        surfaceView.onPause()
         arCoreSession?.pause()
     }
-    
+
     override fun onDestroy() {
         super.onDestroy()
         arCoreSession?.close()
