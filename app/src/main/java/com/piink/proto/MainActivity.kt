@@ -85,7 +85,7 @@ class MainActivity : AppCompatActivity() {
                 // --- CORRECTIF 2 : DÉSACTIVER DEPTH (TEMPORAIRE) ---
                 // Le calcul de profondeur peut tuer les FPS sur certains téléphones.
                 // On le coupe pour tester si le tracking revient.
-                //config.depthMode = Config.DepthMode.DISABLED
+                //config.depthMode = Config.DepthMode.AUTOMATIC
                 config.depthMode = Config.DepthMode.AUTOMATIC // Remettre plus tard si tout va bien
 
                 // On s'assure que l'autofocus est activé
