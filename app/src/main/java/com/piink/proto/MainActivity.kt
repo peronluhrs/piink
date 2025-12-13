@@ -17,7 +17,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var surfaceView: GLSurfaceView
     private var arCoreSession: Session? = null
-    // On instancie notre nouveau moteur de rendu
+    // On garde le même nom de fichier Renderer pour simplifier, 
+    // mais il va afficher des points maintenant.
     private val renderer = DepthRenderer(this)
 
     private val CAMERA_PERMISSION_CODE = 100
@@ -29,12 +30,10 @@ class MainActivity : AppCompatActivity() {
 
         surfaceView = findViewById(R.id.surfaceview)
         
-        // Configuration OpenGL ES 2.0
         surfaceView.preserveEGLContextOnPause = true
         surfaceView.setEGLContextClientVersion(2)
         surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         surfaceView.setRenderer(renderer)
-        // On demande de dessiner en continu
         surfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
         checkAndRequestCameraPermission()
@@ -63,37 +62,14 @@ class MainActivity : AppCompatActivity() {
             if (availability.isSupported) {
                 arCoreSession = Session(this)
 
-                // --- CORRECTIF 1 : FORCER 30 FPS ---
-                // On crée un filtre pour demander explicitement du 30 FPS
-                val filter = com.google.ar.core.CameraConfigFilter(arCoreSession)
-                filter.targetFps = java.util.EnumSet.of(com.google.ar.core.CameraConfig.TargetFps.TARGET_FPS_30)
-
-                // On récupère la liste des caméras compatibles avec ce filtre
-                val cameraConfigs = arCoreSession?.getSupportedCameraConfigs(filter)
-
-                // Si on en trouve une, on l'applique !
-                if (!cameraConfigs.isNullOrEmpty()) {
-                    Log.i(TAG, "Configuration Caméra forcée à 30 FPS")
-                    arCoreSession?.cameraConfig = cameraConfigs[0]
-                } else {
-                    Log.e(TAG, "Aucune configuration 30 FPS trouvée !")
-                }
-                // ------------------------------------
-
+                // CONFIGURATION STANDARD (Optimisée pour le Tracking)
                 val config = Config(arCoreSession)
-
-                // --- CORRECTIF 2 : DÉSACTIVER DEPTH (TEMPORAIRE) ---
-                // Le calcul de profondeur peut tuer les FPS sur certains téléphones.
-                // On le coupe pour tester si le tracking revient.
-                //config.depthMode = Config.DepthMode.AUTOMATIC
-                config.depthMode = Config.DepthMode.AUTOMATIC // Remettre plus tard si tout va bien
-
-                // On s'assure que l'autofocus est activé
                 config.focusMode = Config.FocusMode.AUTO
-
+                // On désactive la Depth pour économiser le CPU puisqu'elle ne marche pas
+                config.depthMode = Config.DepthMode.DISABLED 
+                
                 arCoreSession?.configure(config)
-
-                // === C'EST ICI QU'ON CONNECTE TOUT ===
+                
                 renderer.currentSession = arCoreSession
                 arCoreSession?.resume()
             }
