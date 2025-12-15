@@ -1,0 +1,12 @@
+{
+  version: 2,
+  mediaFileName: 'demo.mp4demo_piink.mp4176564825121717656482512177',
+  cutSegments: [
+    {
+      start: 15.403134607567567,
+      end: 44.111144,
+      name: '',
+      selected: true,
+    },
+  ],
+}
