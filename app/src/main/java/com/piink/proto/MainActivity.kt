@@ -9,7 +9,6 @@ import android.graphics.Color
 import android.media.projection.MediaProjectionManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
-import android.util.Log
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.ToggleButton
@@ -50,9 +49,7 @@ class MainActivity : AppCompatActivity() {
         setupGL()
 
         btnShoot.setOnClickListener {
-            try {
-                renderer.triggerCapture()
-            } catch (e: Exception) {}
+            try { renderer.triggerCapture() } catch (e: Exception) {}
         }
 
         btnRecord.setOnCheckedChangeListener { _, isChecked ->
@@ -73,7 +70,6 @@ class MainActivity : AppCompatActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == CODE_REC) {
-            // RESULT_OK = -1
             if (resultCode == -1 && data != null) {
                 val intent = Intent(this, RecordingService::class.java).apply {
                     putExtra("code", resultCode)
@@ -117,17 +113,14 @@ class MainActivity : AppCompatActivity() {
             if (ArCoreApk.getInstance().checkAvailability(this).isSupported) {
                 arCoreSession = Session(this)
                 val config = Config(arCoreSession)
-                
-                // RETOUR A LA CONFIGURATION "FACILE"
                 config.focusMode = Config.FocusMode.AUTO
-                // On active le placement instantané pour que le clic marche TOUT DE SUITE
                 config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
                 config.depthMode = Config.DepthMode.DISABLED 
-
                 arCoreSession?.configure(config)
                 renderer.currentSession = arCoreSession
                 arCoreSession?.resume()
                 
+                // BOUCLE UI
                 Thread {
                     while (isRunning) {
                         try {
