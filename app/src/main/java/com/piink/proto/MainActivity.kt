@@ -1,11 +1,19 @@
 package com.piink.proto
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.media.projection.MediaProjectionManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
-import android.widget.Button
+import android.util.Log
+import android.widget.ImageButton
 import android.widget.TextView
+import android.widget.ToggleButton
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -17,11 +25,15 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var surfaceView: GLSurfaceView
     private lateinit var tvInfo: TextView
-    private lateinit var btnShoot: Button
+    private lateinit var btnShoot: ImageButton 
+    private lateinit var btnRecord: ToggleButton
 
     private var arCoreSession: Session? = null
     private val renderer = ARRenderer(this)
-    private val CAMERA_PERMISSION_CODE = 100
+    private lateinit var projectionManager: MediaProjectionManager
+    
+    private val CODE_REC = 101
+    private val CODE_PERM = 100
     private var isRunning = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -31,61 +43,106 @@ class MainActivity : AppCompatActivity() {
         surfaceView = findViewById(R.id.surfaceview)
         tvInfo = findViewById(R.id.tvDistance)
         btnShoot = findViewById(R.id.btnShoot)
+        btnRecord = findViewById(R.id.btnRecord)
 
+        projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        setupGL()
+
+        btnShoot.setOnClickListener {
+            try {
+                renderer.triggerCapture()
+            } catch (e: Exception) {}
+        }
+
+        // --- POINT CRITIQUE : LE BOUTON D'ENREGISTREMENT ---
+        btnRecord.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                Log.d("PiinkMain", "Bouton ON -> Demande de permission Android...")
+                // ON NE LANCE PAS LE SERVICE ICI ! ON DEMANDE LA PERMISSION D'ABORD
+                val intent = projectionManager.createScreenCaptureIntent()
+                startActivityForResult(intent, CODE_REC)
+            } else {
+                Log.d("PiinkMain", "Bouton OFF -> Arrêt du Service")
+                val intent = Intent(this, RecordingService::class.java)
+                intent.action = "STOP"
+                startService(intent)
+                btnRecord.setBackgroundColor(Color.parseColor("#88000000"))
+            }
+        }
+
+        checkPerms()
+    }
+
+    // --- RECEPTION DE LA PERMISSION ---
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        
+        if (requestCode == CODE_REC) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                Log.d("PiinkMain", "Permission ACCORDÉE ! Lancement du Service...")
+                
+                val intent = Intent(this, RecordingService::class.java).apply {
+                    putExtra("code", resultCode)
+                    putExtra("data", data)
+                }
+                
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
+                
+                btnRecord.setBackgroundColor(Color.RED)
+            } else {
+                Log.e("PiinkMain", "Permission REFUSÉE ou ANNULÉE")
+                btnRecord.isChecked = false
+                Toast.makeText(this, "Refusé: Pas d'enregistrement", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun setupGL() {
         surfaceView.preserveEGLContextOnPause = true
         surfaceView.setEGLContextClientVersion(2)
         surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         surfaceView.setRenderer(renderer)
         surfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-
-        // ACTION DU BOUTON : On dit juste au Renderer "Fais le taf"
-        btnShoot.setOnClickListener {
-            renderer.triggerCapture()
-        }
-
-        checkAndRequestCameraPermission()
     }
 
-    // BOUCLE UI : Met à jour le texte 10 fois par seconde
-    private fun startUiLoop() {
-        Thread {
-            while (isRunning) {
-                try {
-                    Thread.sleep(100)
-                    val msg = renderer.uiMessage
-                    runOnUiThread { tvInfo.text = msg }
-                } catch (e: Exception) { }
-            }
-        }.start()
-    }
-
-    private fun checkAndRequestCameraPermission() {
+    private fun checkPerms() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE)
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CODE_PERM)
         } else {
-            initializeARCore()
+            initAR()
         }
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        if (requestCode == CAMERA_PERMISSION_CODE && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) initializeARCore()
+    override fun onRequestPermissionsResult(rq: Int, p: Array<String>, res: IntArray) {
+        if (rq == CODE_PERM && res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) initAR()
     }
 
-    private fun initializeARCore() {
+    private fun initAR() {
         try {
             if (ArCoreApk.getInstance().checkAvailability(this).isSupported) {
                 arCoreSession = Session(this)
                 val config = Config(arCoreSession)
                 config.focusMode = Config.FocusMode.AUTO
                 config.depthMode = Config.DepthMode.DISABLED
-                // INSTANT PLACEMENT (Pour les surfaces difficiles)
                 config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
-
                 arCoreSession?.configure(config)
                 renderer.currentSession = arCoreSession
                 arCoreSession?.resume()
-
-                startUiLoop()
+                
+                Thread {
+                    while (isRunning) {
+                        try {
+                            Thread.sleep(100)
+                            val m = renderer.uiMessage
+                            runOnUiThread { tvInfo.text = m }
+                        } catch(e:Exception){}
+                    }
+                }.start()
             }
         } catch (e: Exception) { }
     }
