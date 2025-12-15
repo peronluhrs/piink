@@ -1,6 +1,5 @@
 package com.piink.proto
 
-import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -42,13 +41,19 @@ class RecordingService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    // CORRECTION : On appelle startForeground directement dans onCreate
+    // Sans essayer de "surcharger" (override) la méthode système
     override fun onCreate() {
         super.onCreate()
         val notif = createNotification("Initialisation...")
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(1, notif)
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            } else {
+                startForeground(1, notif)
+            }
+        } catch (e: Exception) {
+            Log.e("REC", "Erreur startForeground: " + e.message)
         }
     }
 
@@ -58,20 +63,19 @@ class RecordingService : Service() {
             return START_NOT_STICKY
         }
 
-        // On initialise resultCode à 0 (Canceled) par défaut, pas -1
         val resultCode = intent?.getIntExtra("code", 0) ?: 0
         val resultData: Intent? = intent?.getParcelableExtra("data")
         
-        // RESULT_OK vaut -1. Donc on vérifie si c'est égal à -1.
-        if (resultCode == Activity.RESULT_OK && resultData != null) {
-            Log.d("PiinkService", "Permission validée (Code: $resultCode). Démarrage...")
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(1, createNotification("🔴 Ça tourne !"))
-            startRecording(resultCode, resultData)
+        // RESULT_OK vaut -1
+        if (resultCode == -1 && resultData != null) {
+            // Petit délai pour la stabilité
+            Handler(Looper.getMainLooper()).postDelayed({
+                startRecording(resultCode, resultData)
+            }, 500)
         } else {
-            Log.e("PiinkService", "ERREUR: Permission invalide (Code: $resultCode)")
-            // On ne stop pas immédiatement pour que vous ayez le temps de lire le toast
+            Log.e("REC", "Permission manquante (Code: $resultCode)")
         }
+
         return START_STICKY
     }
 
@@ -92,28 +96,28 @@ class RecordingService : Service() {
 
     private fun startRecording(code: Int, data: Intent) {
         try {
-            // 1. Fichier temporaire
             val dir = getExternalFilesDir(null)
             val time = SimpleDateFormat("HHmmss", Locale.US).format(Date())
             videoFile = File(dir, "PIINK_$time.mp4")
 
-            // 2. Calcul Résolution (Special Sony 21:9)
+            // Calcul Résolution pour Sony 21:9
             val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val metrics = DisplayMetrics()
             wm.defaultDisplay.getRealMetrics(metrics)
 
-            // On divise par 2 et on aligne sur 16 pixels
+            // Division par 2 et alignement sur 16
             val width = ((metrics.widthPixels / 2) / 16) * 16
             val height = ((metrics.heightPixels / 2) / 16) * 16
-            
-            Log.d("PiinkService", "Config Video: $width x $height")
+            val dpi = metrics.densityDpi
+
+            Log.d("REC", "Resolution: $width x $height")
 
             mediaRecorder = MediaRecorder().apply {
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setOutputFile(videoFile?.absolutePath)
                 setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                setVideoEncodingBitRate(4000000) // 4 Mbps
+                setVideoEncodingBitRate(5000000)
                 setVideoFrameRate(30)
                 setVideoSize(width, height)
                 prepare()
@@ -123,7 +127,7 @@ class RecordingService : Service() {
             mediaProjection = mpm.getMediaProjection(code, data)
             
             virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "PiinkRec", width, height, metrics.densityDpi,
+                "PiinkRec", width, height, dpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 mediaRecorder?.surface, null, null
             )
@@ -131,11 +135,13 @@ class RecordingService : Service() {
             mediaRecorder?.start()
             isRecording = true
             
-            toast("🎥 REC Démarré")
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(1, createNotification("🔴 REC: $width x $height"))
+            
+            toast("🎥 REC Démarré !")
             
         } catch (e: Exception) {
-            Log.e("PiinkService", "CRASH START: " + e.message)
-            e.printStackTrace()
+            Log.e("REC", "CRASH START: " + e.message)
             stopSelf()
         }
     }
@@ -147,7 +153,7 @@ class RecordingService : Service() {
             mediaRecorder?.stop()
             mediaRecorder?.reset()
         } catch (e: Exception) {
-            Log.e("PiinkService", "Stop error: " + e.message)
+            Log.e("REC", "Erreur Stop: " + e.message)
         }
         
         try {
@@ -163,7 +169,7 @@ class RecordingService : Service() {
         if (videoFile != null && videoFile!!.exists() && videoFile!!.length() > 0) {
             saveToGallery(videoFile!!)
         } else {
-            toast("⚠️ Erreur : Vidéo vide")
+            toast("⚠️ Fichier vide")
         }
     }
 
@@ -178,24 +184,19 @@ class RecordingService : Service() {
             }
 
             val resolver = contentResolver
-            val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            val itemUri = resolver.insert(collection, values)
+            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
 
-            if (itemUri != null) {
-                resolver.openOutputStream(itemUri).use { out ->
-                    FileInputStream(sourceFile).use { input ->
-                        input.copyTo(out!!)
-                    }
+            if (uri != null) {
+                resolver.openOutputStream(uri).use { out ->
+                    FileInputStream(sourceFile).use { input -> input.copyTo(out!!) }
                 }
                 values.clear()
                 values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                resolver.update(itemUri, values, null, null)
-                
+                resolver.update(uri, values, null, null)
                 toast("✅ SAUVÉ DANS GALERIE !")
             }
         } catch (e: Exception) {
-            Log.e("PiinkService", "Erreur Galerie: " + e.message)
-            toast("Erreur copie Galerie")
+            Log.e("REC", "Erreur copie: " + e.message)
         }
     }
 

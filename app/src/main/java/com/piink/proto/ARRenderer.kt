@@ -5,9 +5,12 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
-import android.view.Surface
+import android.util.Log
 import com.google.ar.core.Anchor
+import com.google.ar.core.InstantPlacementPoint
+import com.google.ar.core.Plane
 import com.google.ar.core.Session
+import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -15,211 +18,255 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.sqrt
 
-class ARRenderer(private val context: Context) : GLSurfaceView.Renderer {
-
-    // --- COMMUNICATION ---
-    @Volatile var uiMessage: String = "Initialisation..."
-    @Volatile var shouldCapture: Boolean = false
-
-    // ANCRES
-    var anchorA: Anchor? = null
-    var anchorB: Anchor? = null
-
-    // OPENGL VARS
-    private var cameraTextureId = -1
-    private var bgProgramId = -1
-    private var bgPositionAttrib = -1
-    private var bgTexCoordAttrib = -1
-    private var bgTextureUniform = -1
-
-    private var pointProgramId = -1
-    private var pointPositionAttrib = -1
-    private var pointMvpUniform = -1
-    private var pointColorUniform = -1
-    private var pointSizeUniform = -1
-
-    private val bgVertices = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val bgTexCoords = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val bgTransformedTexCoords = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer()
-    private val measurePointVertices: FloatBuffer
-
-    private val viewMatrix = FloatArray(16)
-    private val projectionMatrix = FloatArray(16)
-    private val modelMatrix = FloatArray(16)
-    private val mvpMatrix = FloatArray(16)
+class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
 
     var currentSession: Session? = null
-    private var viewportWidth = 1
-    private var viewportHeight = 1
-    private var isReady = false
+    var uiMessage = "Initialisation..."
+    private val anchors = mutableListOf<Anchor>() // Liste des points (Max 2)
+    private var shouldCapture = false
+    private var viewportWidth = 0
+    private var viewportHeight = 0
+    private var lastDistance = ""
 
-    init {
-        bgVertices.put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)).position(0)
-        bgTexCoords.put(floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)).position(0)
+    // --- VARIABLES OPENGL ---
+    
+    // 1. Fond Caméra
+    private var textureId = -1
+    private lateinit var quadVertices: FloatBuffer
+    private lateinit var quadTexCoords: FloatBuffer
+    private var bgProgram: Int = 0
+    private var bgPosHandle: Int = 0
+    private var bgTexHandle: Int = 0
+    private var bgTexUniform: Int = 0
 
-        // Cube de 3cm pour les points
-        val s = 0.015f
-        val pCoords = floatArrayOf(-s, -s, s, s, -s, s, s, s, s, -s, s, s, -s, -s, -s, s, -s, -s, s, s, -s, -s, s, -s)
-        measurePointVertices = ByteBuffer.allocateDirect(pCoords.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(pCoords)
-        measurePointVertices.position(0)
-    }
+    // 2. Croix (Ancre) & Ligne de mesure
+    private val crossVertices = floatArrayOf(
+        -0.05f, 0.0f,  0.0f,  0.05f, 0.0f,  0.0f, 
+         0.0f,  0.0f, -0.05f,  0.0f,  0.0f,  0.05f
+    )
+    private lateinit var crossBuffer: FloatBuffer
+    private var crossProgram: Int = 0
+    private var crossPosHandle: Int = 0
+    private var crossColorHandle: Int = 0
+    private var crossMVPHandle: Int = 0
+    
+    // 3. Nuage de points (Feedback visuel)
+    private var pointProgram: Int = 0
+    private var pointPosHandle: Int = 0
+    private var pointSizeHandle: Int = 0
+    private var pointMVPHandle: Int = 0
 
-    fun triggerCapture() {
-        shouldCapture = true
-    }
+    // Matrices
+    private val projMtx = FloatArray(16)
+    private val viewMtx = FloatArray(16)
+    private val modelMtx = FloatArray(16)
+    private val mvpMtx = FloatArray(16)
+    private val identityMtx = FloatArray(16) // Pour dessiner la ligne entre 2 points
+
+    // Couleurs
+    private val colorWhite = floatArrayOf(1f, 1f, 1f, 1f)
+    private val colorGreen = floatArrayOf(0f, 1f, 0f, 1f) // Pour la ligne de mesure
+
+    // Shaders
+    private val vShaderCam = "attribute vec4 vPos; attribute vec2 vTex; varying vec2 fTex; void main(){gl_Position=vPos; fTex=vTex;}"
+    private val fShaderCam = "#extension GL_OES_EGL_image_external : require\nprecision mediump float; varying vec2 fTex; uniform samplerExternalOES sTex; void main(){gl_FragColor=texture2D(sTex,fTex);}"
+    
+    private val vShaderSimple = "uniform mat4 uMVP; attribute vec4 vPos; uniform float uPSize; void main(){gl_Position=uMVP*vPos; gl_PointSize=uPSize;}"
+    private val fShaderColor = "precision mediump float; uniform vec4 vCol; void main(){gl_FragColor=vCol;}"
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        cameraTextureId = textures[0]
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
+        Matrix.setIdentityM(identityMtx, 0)
 
-        val bgV = "attribute vec4 p; attribute vec2 t; varying vec2 v; void main(){gl_Position=p;v=t;}"
-        val bgF = "#extension GL_OES_EGL_image_external : require\nprecision mediump float; uniform samplerExternalOES s; varying vec2 v; void main(){gl_FragColor=texture2D(s,v);}"
-        bgProgramId = loadProgram(bgV, bgF)
-        bgPositionAttrib = GLES20.glGetAttribLocation(bgProgramId, "p")
-        bgTexCoordAttrib = GLES20.glGetAttribLocation(bgProgramId, "t")
-        bgTextureUniform = GLES20.glGetUniformLocation(bgProgramId, "s")
+        // INIT TEXTURE CAMERA
+        val tex = IntArray(1)
+        GLES20.glGenTextures(1, tex, 0)
+        textureId = tex[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST.toFloat())
+        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST.toFloat())
+        currentSession?.setCameraTextureName(textureId)
 
-        val pV = "uniform mat4 mvp; uniform float size; attribute vec4 p; void main(){gl_Position=mvp*p; gl_PointSize=size;}"
-        val pF = "precision mediump float; uniform vec4 c; void main(){gl_FragColor=c;}"
-        pointProgramId = loadProgram(pV, pF)
-        pointPositionAttrib = GLES20.glGetAttribLocation(pointProgramId, "p")
-        pointMvpUniform = GLES20.glGetUniformLocation(pointProgramId, "mvp")
-        pointColorUniform = GLES20.glGetUniformLocation(pointProgramId, "c")
-        pointSizeUniform = GLES20.glGetUniformLocation(pointProgramId, "size")
+        // INIT BUFFERS
+        quadVertices = makeBuffer(floatArrayOf(-1f, -1f, 0f, -1f, 1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f))
+        quadTexCoords = makeBuffer(floatArrayOf(0f, 1f, 0f, 0f, 1f, 1f, 1f, 0f))
+        crossBuffer = makeBuffer(crossVertices)
+
+        // INIT PROGRAMMES
+        bgProgram = createProgram(vShaderCam, fShaderCam)
+        bgPosHandle = GLES20.glGetAttribLocation(bgProgram, "vPos")
+        bgTexHandle = GLES20.glGetAttribLocation(bgProgram, "vTex")
+        bgTexUniform = GLES20.glGetUniformLocation(bgProgram, "sTex")
+
+        crossProgram = createProgram(vShaderSimple, fShaderColor)
+        crossPosHandle = GLES20.glGetAttribLocation(crossProgram, "vPos")
+        crossMVPHandle = GLES20.glGetUniformLocation(crossProgram, "uMVP")
+        crossColorHandle = GLES20.glGetUniformLocation(crossProgram, "vCol")
+        
+        pointProgram = createProgram(vShaderSimple, fShaderColor)
+        pointPosHandle = GLES20.glGetAttribLocation(pointProgram, "vPos")
+        pointMVPHandle = GLES20.glGetUniformLocation(pointProgram, "uMVP")
+        pointSizeHandle = GLES20.glGetUniformLocation(pointProgram, "uPSize")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        GLES20.glViewport(0, 0, width, height)
         viewportWidth = width
         viewportHeight = height
-        GLES20.glViewport(0, 0, width, height)
-        currentSession?.setDisplayGeometry(Surface.ROTATION_0, width, height)
+        currentSession?.setDisplayGeometry(0, width, height)
     }
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-        val session = currentSession ?: return
-        if (cameraTextureId != -1) session.setCameraTextureName(cameraTextureId)
-        session.setDisplayGeometry(Surface.ROTATION_0, viewportWidth, viewportHeight)
+        if (currentSession == null) return
 
         try {
-            val frame = session.update()
-
-            // --- MISE A JOUR DU STATUT (Correctif) ---
-            if (!isReady) {
-                isReady = true
-                uiMessage = "✅ PRÊT. Visez le coin A et CLIQUEZ."
-            }
-
-            // --- LOGIQUE DE CAPTURE ---
-            if (shouldCapture) {
-                val hits = frame.hitTest(viewportWidth / 2f, viewportHeight / 2f)
-                val hit = hits.firstOrNull()
-
-                if (hit != null) {
-                    val anchor = hit.createAnchor()
-
-                    if (anchorA == null) {
-                        anchorA = anchor
-                        uiMessage = "✅ A (Vert) fixé.\nVisez B et cliquez..."
-                    }
-                    else if (anchorB == null) {
-                        anchorB = anchor
-                        val dist = calculateDistance(anchorA!!, anchorB!!)
-                        uiMessage = "🏁 RÉSULTAT : %.1f cm\n(Cliquez encore pour Reset)".format(dist)
-                    }
-                    else {
-                        // RESET
-                        anchorA?.detach()
-                        anchorB?.detach()
-                        anchorA = anchor
-                        anchorB = null
-                        uiMessage = "✅ Nouveau Point A fixé.\nVisez B..."
-                    }
-                } else {
-                    uiMessage = "⚠️ RIEN DÉTECTÉ AU CENTRE.\nVisez un détail contrasté !"
-                }
-                shouldCapture = false
-            }
-
-            // DESSIN FOND
-            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
-            frame.transformDisplayUvCoords(bgTexCoords, bgTransformedTexCoords)
-            GLES20.glUseProgram(bgProgramId)
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
-            GLES20.glUniform1i(bgTextureUniform, 0)
-            GLES20.glEnableVertexAttribArray(bgPositionAttrib)
-            GLES20.glVertexAttribPointer(bgPositionAttrib, 2, GLES20.GL_FLOAT, false, 0, bgVertices)
-            GLES20.glEnableVertexAttribArray(bgTexCoordAttrib)
-            GLES20.glVertexAttribPointer(bgTexCoordAttrib, 2, GLES20.GL_FLOAT, false, 0, bgTransformedTexCoords)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            GLES20.glDisableVertexAttribArray(bgPositionAttrib)
-            GLES20.glDisableVertexAttribArray(bgTexCoordAttrib)
-
-            // DESSIN POINTS
+            if (textureId != -1) currentSession!!.setCameraTextureName(textureId)
+            val frame = currentSession!!.update()
             val camera = frame.camera
-            camera.getProjectionMatrix(projectionMatrix, 0, 0.1f, 100f)
-            camera.getViewMatrix(viewMatrix, 0)
 
-            // Nuage de points (Aide visuelle)
+            handleTap(frame, camera)
+            
+            // 1. DESSIN CAMERA
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            GLES20.glUseProgram(bgProgram)
+            
+            val uvs = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer()
+            frame.transformDisplayUvCoords(quadTexCoords, uvs)
+            
+            GLES20.glVertexAttribPointer(bgPosHandle, 3, GLES20.GL_FLOAT, false, 0, quadVertices)
+            GLES20.glVertexAttribPointer(bgTexHandle, 2, GLES20.GL_FLOAT, false, 0, uvs)
+            GLES20.glEnableVertexAttribArray(bgPosHandle)
+            GLES20.glEnableVertexAttribArray(bgTexHandle)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+            GLES20.glUniform1i(bgTexUniform, 0)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+            // MATRICES 3D
+            camera.getProjectionMatrix(projMtx, 0, 0.1f, 100f)
+            camera.getViewMatrix(viewMtx, 0)
+            Matrix.multiplyMM(mvpMtx, 0, projMtx, 0, viewMtx, 0) // VP Matrix
+
+            // 2. DESSIN POINTS (FEEDBACK JAUNE)
+            GLES20.glUseProgram(pointProgram)
             val pointCloud = frame.acquirePointCloud()
-            if (pointCloud.points.remaining() > 0) {
-                 Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
-                 GLES20.glUseProgram(pointProgramId)
-                 GLES20.glUniform4f(pointColorUniform, 1f, 1f, 0f, 0.5f)
-                 GLES20.glUniform1f(pointSizeUniform, 10.0f)
-                 GLES20.glUniformMatrix4fv(pointMvpUniform, 1, false, mvpMatrix, 0)
-                 GLES20.glEnableVertexAttribArray(pointPositionAttrib)
-                 GLES20.glVertexAttribPointer(pointPositionAttrib, 4, GLES20.GL_FLOAT, false, 16, pointCloud.points)
+            if (pointCloud.points != null) {
+                 GLES20.glUniformMatrix4fv(pointMVPHandle, 1, false, mvpMtx, 0)
+                 GLES20.glUniform1f(pointSizeHandle, 15.0f)
+                 GLES20.glUniform4fv(GLES20.glGetUniformLocation(pointProgram, "vCol"), 1, floatArrayOf(1f, 0.8f, 0f, 1f), 0) // Jaune
+                 GLES20.glVertexAttribPointer(pointPosHandle, 4, GLES20.GL_FLOAT, false, 16, pointCloud.points)
+                 GLES20.glEnableVertexAttribArray(pointPosHandle)
                  GLES20.glDrawArrays(GLES20.GL_POINTS, 0, pointCloud.points.remaining() / 4)
-                 GLES20.glDisableVertexAttribArray(pointPositionAttrib)
             }
             pointCloud.release()
 
-            // Points A et B
-            GLES20.glUseProgram(pointProgramId)
-            GLES20.glUniform1f(pointSizeUniform, 1.0f)
-            GLES20.glEnableVertexAttribArray(pointPositionAttrib)
-            GLES20.glVertexAttribPointer(pointPositionAttrib, 3, GLES20.GL_FLOAT, false, 0, measurePointVertices)
+            // 3. DESSIN DES ANCRES (CROIX)
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+            GLES20.glUseProgram(crossProgram)
+            
+            for (anchor in anchors) {
+                if (anchor.trackingState != TrackingState.TRACKING) continue
+                anchor.pose.toMatrix(modelMtx, 0)
+                Matrix.multiplyMM(mvpMtx, 0, projMtx, 0, viewMtx, 0) 
+                Matrix.multiplyMM(mvpMtx, 0, mvpMtx, 0, modelMtx, 0)
+                
+                GLES20.glUniformMatrix4fv(crossMVPHandle, 1, false, mvpMtx, 0)
+                GLES20.glUniform4fv(crossColorHandle, 1, colorWhite, 0)
+                GLES20.glVertexAttribPointer(crossPosHandle, 3, GLES20.GL_FLOAT, false, 0, crossBuffer)
+                GLES20.glEnableVertexAttribArray(crossPosHandle)
+                GLES20.glLineWidth(8f)
+                GLES20.glDrawArrays(GLES20.GL_LINES, 0, 4)
+            }
 
-            anchorA?.let { drawAnchor(it, 0f, 1f, 0f) } // Vert
-            anchorB?.let { drawAnchor(it, 1f, 0f, 0f) } // Rouge
+            // 4. DESSIN DE LA LIGNE DE MESURE (Si 2 points)
+            if (anchors.size == 2 && anchors[0].trackingState == TrackingState.TRACKING && anchors[1].trackingState == TrackingState.TRACKING) {
+                drawLineBetweenAnchors(anchors[0], anchors[1])
+            }
 
-            GLES20.glDisableVertexAttribArray(pointPositionAttrib)
-
-        } catch (e: Exception) { }
+        } catch (e: Exception) { Log.e("RENDERER", "Err: " + e.message) }
     }
 
-    private fun drawAnchor(anchor: Anchor, r: Float, g: Float, b: Float) {
-        if (anchor.trackingState == com.google.ar.core.TrackingState.TRACKING) {
-            anchor.pose.toMatrix(modelMatrix, 0)
-            Matrix.multiplyMM(mvpMatrix, 0, viewMatrix, 0, modelMatrix, 0)
-            Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, mvpMatrix, 0)
-            GLES20.glUniformMatrix4fv(pointMvpUniform, 1, false, mvpMatrix, 0)
-            GLES20.glUniform4f(pointColorUniform, r, g, b, 1f)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 8)
-            GLES20.glDrawArrays(GLES20.GL_POINTS, 0, 1)
+    private fun drawLineBetweenAnchors(a1: Anchor, a2: Anchor) {
+        val p1 = a1.pose
+        val p2 = a2.pose
+        val lineCoords = floatArrayOf(
+            p1.tx(), p1.ty(), p1.tz(),
+            p2.tx(), p2.ty(), p2.tz()
+        )
+        val lineBuff = makeBuffer(lineCoords)
+        
+        // On utilise la matrice VP (sans modele) car les points sont deja en coordonnées monde
+        Matrix.multiplyMM(mvpMtx, 0, projMtx, 0, viewMtx, 0)
+        
+        GLES20.glUniformMatrix4fv(crossMVPHandle, 1, false, mvpMtx, 0)
+        GLES20.glUniform4fv(crossColorHandle, 1, colorGreen, 0) // Ligne VERTE
+        GLES20.glVertexAttribPointer(crossPosHandle, 3, GLES20.GL_FLOAT, false, 0, lineBuff)
+        GLES20.glEnableVertexAttribArray(crossPosHandle)
+        GLES20.glLineWidth(10f)
+        GLES20.glDrawArrays(GLES20.GL_LINES, 0, 2)
+    }
+
+    private fun handleTap(frame: com.google.ar.core.Frame, camera: com.google.ar.core.Camera) {
+        if (shouldCapture && viewportWidth > 0) {
+            
+            // LOGIQUE DE CYCLE : A -> B -> RESET
+            if (anchors.size >= 2) {
+                // RESET
+                anchors.forEach { it.detach() }
+                anchors.clear()
+                uiMessage = "🗑️ Reset. Placez Point A."
+                // On continue pour placer le Point A tout de suite (optionnel, plus fluide)
+            }
+
+            val hits = frame.hitTest(viewportWidth / 2f, viewportHeight / 2f)
+            for (hit in hits) {
+                val trackable = hit.trackable
+                if ((trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)) ||
+                    (trackable is com.google.ar.core.Point) ||
+                    (trackable is InstantPlacementPoint)) {
+                    
+                    val newAnchor = hit.createAnchor()
+                    anchors.add(newAnchor)
+                    
+                    if (anchors.size == 1) {
+                        uiMessage = "📍 Point A placé. Visez Point B."
+                    } else if (anchors.size == 2) {
+                        val dist = calculateDistance(anchors[0], anchors[1])
+                        uiMessage = "📏 DISTANCE : %.2f m".format(dist)
+                        lastDistance = uiMessage
+                    }
+                    break
+                }
+            }
+            shouldCapture = false
+        }
+        
+        // UI Message Persistant pour la distance
+        if (anchors.size == 2) {
+            uiMessage = lastDistance
+        } else if (anchors.isEmpty() && uiMessage.contains("Distance")) {
+            uiMessage = "🎯 Visez et Cliquez"
         }
     }
 
-    private fun calculateDistance(a: Anchor, b: Anchor): Float {
-        val dx = a.pose.tx() - b.pose.tx()
-        val dy = a.pose.ty() - b.pose.ty()
-        val dz = a.pose.tz() - b.pose.tz()
-        return sqrt(dx*dx + dy*dy + dz*dz) * 100
+    private fun calculateDistance(a1: Anchor, a2: Anchor): Float {
+        val dx = a1.pose.tx() - a2.pose.tx()
+        val dy = a1.pose.ty() - a2.pose.ty()
+        val dz = a1.pose.tz() - a2.pose.tz()
+        return sqrt(dx*dx + dy*dy + dz*dz)
     }
 
-    private fun loadProgram(v: String, f: String): Int {
-        val vs = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER); GLES20.glShaderSource(vs, v); GLES20.glCompileShader(vs)
-        val fs = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER); GLES20.glShaderSource(fs, f); GLES20.glCompileShader(fs)
-        val p = GLES20.glCreateProgram(); GLES20.glAttachShader(p, vs); GLES20.glAttachShader(p, fs); GLES20.glLinkProgram(p)
-        return p
+    fun triggerCapture() { shouldCapture = true }
+
+    private fun makeBuffer(arr: FloatArray): FloatBuffer {
+        val bb = ByteBuffer.allocateDirect(arr.size * 4).order(ByteOrder.nativeOrder())
+        return bb.asFloatBuffer().put(arr).apply { position(0) }
+    }
+
+    private fun createProgram(v: String, f: String): Int {
+        val vs = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also { GLES20.glShaderSource(it, v); GLES20.glCompileShader(it) }
+        val fs = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER).also { GLES20.glShaderSource(it, f); GLES20.glCompileShader(it) }
+        return GLES20.glCreateProgram().also { GLES20.glAttachShader(it, vs); GLES20.glAttachShader(it, fs); GLES20.glLinkProgram(it) }
     }
 }

@@ -55,15 +55,11 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {}
         }
 
-        // --- POINT CRITIQUE : LE BOUTON D'ENREGISTREMENT ---
         btnRecord.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) {
-                Log.d("PiinkMain", "Bouton ON -> Demande de permission Android...")
-                // ON NE LANCE PAS LE SERVICE ICI ! ON DEMANDE LA PERMISSION D'ABORD
                 val intent = projectionManager.createScreenCaptureIntent()
                 startActivityForResult(intent, CODE_REC)
             } else {
-                Log.d("PiinkMain", "Bouton OFF -> Arrêt du Service")
                 val intent = Intent(this, RecordingService::class.java)
                 intent.action = "STOP"
                 startService(intent)
@@ -74,30 +70,24 @@ class MainActivity : AppCompatActivity() {
         checkPerms()
     }
 
-    // --- RECEPTION DE LA PERMISSION ---
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        
         if (requestCode == CODE_REC) {
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                Log.d("PiinkMain", "Permission ACCORDÉE ! Lancement du Service...")
-                
+            // RESULT_OK = -1
+            if (resultCode == -1 && data != null) {
                 val intent = Intent(this, RecordingService::class.java).apply {
                     putExtra("code", resultCode)
                     putExtra("data", data)
                 }
-                
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                     startForegroundService(intent)
                 } else {
                     startService(intent)
                 }
-                
                 btnRecord.setBackgroundColor(Color.RED)
             } else {
-                Log.e("PiinkMain", "Permission REFUSÉE ou ANNULÉE")
                 btnRecord.isChecked = false
-                Toast.makeText(this, "Refusé: Pas d'enregistrement", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Refusé", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -127,9 +117,13 @@ class MainActivity : AppCompatActivity() {
             if (ArCoreApk.getInstance().checkAvailability(this).isSupported) {
                 arCoreSession = Session(this)
                 val config = Config(arCoreSession)
+                
+                // RETOUR A LA CONFIGURATION "FACILE"
                 config.focusMode = Config.FocusMode.AUTO
-                config.depthMode = Config.DepthMode.DISABLED
+                // On active le placement instantané pour que le clic marche TOUT DE SUITE
                 config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
+                config.depthMode = Config.DepthMode.DISABLED 
+
                 arCoreSession?.configure(config)
                 renderer.currentSession = arCoreSession
                 arCoreSession?.resume()
