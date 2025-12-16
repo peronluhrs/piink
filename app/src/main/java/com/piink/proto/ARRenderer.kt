@@ -6,10 +6,9 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.util.Log
-import com.google.ar.core.Anchor
-import com.google.ar.core.Plane
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import com.google.ar.core.Plane
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -29,7 +28,7 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
     
     private var detectedPlane: Plane? = null
 
-    // OPENGL VARS
+    // OPENGL
     private var textureId = -1
     private lateinit var quadVertices: FloatBuffer
     private lateinit var quadTexCoords: FloatBuffer
@@ -49,10 +48,9 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
     private val mvpMtx = FloatArray(16)
     private val planeModelMtx = FloatArray(16) 
 
-    // Couleurs
-    private val colorContour = floatArrayOf(0f, 1f, 0f, 1f)    // Vert (Forme brute)
-    private val colorRect = floatArrayOf(1f, 0f, 0f, 1f)       // Rouge (Rectangle corrigé)
-    private val colorFill = floatArrayOf(1f, 0f, 0f, 0.3f)     // Remplissage Rouge
+    private val colorContour = floatArrayOf(0f, 1f, 0f, 1f)    
+    private val colorRect = floatArrayOf(1f, 0f, 0f, 1f)       
+    private val colorFill = floatArrayOf(1f, 0f, 0f, 0.3f)     
 
     // SHADERS
     private val vShaderCam = "attribute vec4 vPos; attribute vec2 vTex; varying vec2 fTex; void main(){gl_Position=vPos; fTex=vTex;}"
@@ -95,61 +93,75 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        // Nettoyage standard
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        
         if (currentSession == null) return
 
         try {
+            // Mise à jour texture caméra
             if (textureId != -1) currentSession!!.setCameraTextureName(textureId)
             val frame = currentSession!!.update()
             val camera = frame.camera
 
-            findPlaneUnderCrosshair(frame)
-
-            // 1. CAMERA
-            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            // --- ETAPE 1 : DESSIN CAMERA (PRIORITE ABSOLUE) ---
+            // On le fait avant tout calcul complexe pour garantir qu'on voit quelque chose
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST) // Fond d'écran
             GLES20.glUseProgram(bgProgram)
+
             val uvs = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer()
             frame.transformDisplayUvCoords(quadTexCoords, uvs)
+            
             GLES20.glVertexAttribPointer(bgPosHandle, 3, GLES20.GL_FLOAT, false, 0, quadVertices)
             GLES20.glVertexAttribPointer(bgTexHandle, 2, GLES20.GL_FLOAT, false, 0, uvs)
+            
             GLES20.glEnableVertexAttribArray(bgPosHandle)
             GLES20.glEnableVertexAttribArray(bgTexHandle)
+            
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
             GLES20.glUniform1i(bgTexUniform, 0)
+            
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
+            // Important : On désactive les attributs pour ne pas polluer la suite
+            GLES20.glDisableVertexAttribArray(bgPosHandle)
+            GLES20.glDisableVertexAttribArray(bgTexHandle)
+            // --------------------------------------------------
+
+            // --- ETAPE 2 : LOGIQUE METIER ---
+            findPlaneUnderCrosshair(frame)
+            
             camera.getProjectionMatrix(projMtx, 0, 0.1f, 100f)
             camera.getViewMatrix(viewMtx, 0)
             
-            // 2. DESSIN DE LA SURFACE AUTOMATIQUE
+            // --- ETAPE 3 : DESSIN SURFACE ---
             if (detectedPlane != null && detectedPlane!!.trackingState == TrackingState.TRACKING) {
+                // On réactive le Depth Test pour la 3D
+                GLES20.glEnable(GLES20.GL_DEPTH_TEST)
                 drawDetectedPlane(detectedPlane!!)
             } else {
-                 uiMessage = "Scannez le sol pour détecter une surface..."
+                 uiMessage = "Scannez le sol..."
             }
 
-        } catch (e: Exception) { Log.e("RENDERER", "Err: " + e.message) }
+        } catch (e: Exception) { 
+            // Si ça plante ici, la vidéo est déjà dessinée, donc pas d'écran noir !
+            Log.e("RENDERER", "Erreur Rendu: " + e.message) 
+        }
     }
 
     private fun findPlaneUnderCrosshair(frame: com.google.ar.core.Frame) {
         if (viewportWidth == 0) return
-        
         val hits = frame.hitTest(viewportWidth / 2f, viewportHeight / 2f)
-        var found = false
-        
+        var found: Plane? = null
         for (hit in hits) {
             val trackable = hit.trackable
             if (trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)) {
-                detectedPlane = trackable
-                found = true
+                found = trackable
                 break
             }
         }
-        
-        if (!found) {
-            // Si on vise le vide, on n'efface pas la plane précédente pour ne pas faire clignoter
-        }
+        detectedPlane = found
     }
 
     private fun drawDetectedPlane(plane: Plane) {
@@ -160,9 +172,9 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
         Matrix.multiplyMM(mvpMtx, 0, viewMtx, 0, planeModelMtx, 0)
         Matrix.multiplyMM(mvpMtx, 0, projMtx, 0, mvpMtx, 0)
 
+        // Extraction points
         val vertexCount = polygon.remaining() / 2
         val rawCoords = FloatArray(vertexCount * 3)
-        
         var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
         var minZ = Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
         
@@ -171,20 +183,13 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
         while (polygon.hasRemaining()) {
             val x = polygon.get()
             val z = polygon.get()
-            
-            rawCoords[i*3] = x
-            rawCoords[i*3+1] = 0f 
-            rawCoords[i*3+2] = z
-            
-            minX = min(minX, x)
-            maxX = max(maxX, x)
-            minZ = min(minZ, z)
-            maxZ = max(maxZ, z)
-            
+            rawCoords[i*3] = x; rawCoords[i*3+1] = 0f; rawCoords[i*3+2] = z
+            minX = min(minX, x); maxX = max(maxX, x)
+            minZ = min(minZ, z); maxZ = max(maxZ, z)
             i++
         }
         
-        // 1. DESSIN CONTOUR BRUT (VERT)
+        // 1. Dessin Contour Vert
         val polyBuff = makeBuffer(rawCoords)
         GLES20.glUseProgram(standardProgram)
         GLES20.glUniformMatrix4fv(mvpHandle, 1, false, mvpMtx, 0)
@@ -193,54 +198,45 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
         GLES20.glEnableVertexAttribArray(posHandle)
         GLES20.glLineWidth(5f)
         GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, vertexCount)
+        GLES20.glDisableVertexAttribArray(posHandle)
 
-        // 2. RECTANGLE ENGLOBANT (ROUGE)
+        // 2. Dessin Rectangle Rouge
         val width = maxX - minX
         val depth = maxZ - minZ
         val area = width * depth
         
-        val rectCoords = floatArrayOf(
-            minX, 0.01f, minZ,
-            maxX, 0.01f, minZ,
-            maxX, 0.01f, maxZ,
-            minX, 0.01f, maxZ
-        )
+        val rectCoords = floatArrayOf(minX,0.01f,minZ, maxX,0.01f,minZ, maxX,0.01f,maxZ, minX,0.01f,maxZ)
         val rectBuff = makeBuffer(rectCoords)
         
-        // Remplissage Rouge Transparent
         GLES20.glUniform4fv(colorHandle, 1, colorFill, 0) 
         GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, 0, rectBuff)
+        GLES20.glEnableVertexAttribArray(posHandle)
+        
+        // Astuce visibilité : Pas de Depth Test pour le remplissage
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
-        GLES20.glDisable(GLES20.GL_CULL_FACE)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_FAN, 0, 4)
         
-        // Cadre Rouge
         GLES20.glUniform4fv(colorHandle, 1, colorRect, 0)
         GLES20.glLineWidth(10f)
         GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 4)
         
+        // Reset states
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-        GLES20.glEnable(GLES20.GL_CULL_FACE)
+        GLES20.glDisableVertexAttribArray(posHandle)
 
         updateInfo(width, depth, area)
     }
 
     private fun updateInfo(w: Float, h: Float, area: Float) {
-        val text = StringBuilder()
-        text.append("DETECTION AUTO\n")
-        text.append("----------------\n")
-        text.append("Largeur : %.2f m\n".format(w))
-        text.append("Long.   : %.2f m\n".format(h))
-        text.append("\nSURFACE : %.2f m²".format(area))
-        
+        val text = "AUTO-SCAN\nLarg: %.2f m\nLong: %.2f m\nSURFACE: %.2f m²".format(w, h, area)
         if (abs(area - lastArea) > 0.05f) { 
-            uiMessage = text.toString()
+            uiMessage = text
             lastArea = area
         }
     }
     private var lastArea = 0f
 
-    fun triggerCapture() { /* Non utilisé en mode Auto */ }
+    fun triggerCapture() { /* Vide pour l'instant */ }
 
     private fun makeBuffer(arr: FloatArray): FloatBuffer {
         val bb = ByteBuffer.allocateDirect(arr.size * 4).order(ByteOrder.nativeOrder())
