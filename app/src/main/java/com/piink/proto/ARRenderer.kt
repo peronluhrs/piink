@@ -7,77 +7,63 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.util.Log
 import com.google.ar.core.Anchor
-import com.google.ar.core.InstantPlacementPoint
 import com.google.ar.core.Plane
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.util.concurrent.CopyOnWriteArrayList
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
-import kotlin.math.sqrt
-
-// Structure pour transférer les infos de texte à l'activité
-data class ARLabel(val x: Float, val y: Float, val text: String, val type: Int)
-// type 0 = Lettre (A,B..), 1 = Mesure (1.5m)
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
 
     var currentSession: Session? = null
-    var uiMessage = "Initialisation..."
+    @Volatile var uiMessage = "Scannez le sol..."
     
-    // LISTE DES LABELS (Partagée avec MainActivity)
-    val labelsToDraw = CopyOnWriteArrayList<ARLabel>()
-
-    private val anchors = mutableListOf<Anchor>() 
-    private var shouldCapture = false
     private var viewportWidth = 0
     private var viewportHeight = 0
-    private var lastInfo = ""
+    
+    private var detectedPlane: Plane? = null
 
-    // --- OPENGL ---
+    // OPENGL VARS
     private var textureId = -1
     private lateinit var quadVertices: FloatBuffer
     private lateinit var quadTexCoords: FloatBuffer
+    
     private var bgProgram: Int = 0
     private var bgPosHandle: Int = 0
     private var bgTexHandle: Int = 0
     private var bgTexUniform: Int = 0
 
-    private val crossVertices = floatArrayOf(
-        -0.05f, 0.0f,  0.0f,  0.05f, 0.0f,  0.0f, 
-         0.0f,  0.0f, -0.05f,  0.0f,  0.0f,  0.05f
-    )
-    private lateinit var crossBuffer: FloatBuffer
-    private var crossProgram: Int = 0
-    private var crossPosHandle: Int = 0
-    private var crossColorHandle: Int = 0
-    private var crossMVPHandle: Int = 0
-    
-    private var pointProgram: Int = 0
-    private var pointPosHandle: Int = 0
-    private var pointSizeHandle: Int = 0
-    private var pointMVPHandle: Int = 0
+    private var standardProgram: Int = 0
+    private var posHandle: Int = 0
+    private var colorHandle: Int = 0
+    private var mvpHandle: Int = 0
 
-    // Matrices
     private val projMtx = FloatArray(16)
     private val viewMtx = FloatArray(16)
-    private val mvpMtx = FloatArray(16) // View * Projection
-    private val modelMtx = FloatArray(16)
-    private val finalMtx = FloatArray(16) // MVP * Model
+    private val mvpMtx = FloatArray(16)
+    private val planeModelMtx = FloatArray(16) 
 
-    private val colorWhite = floatArrayOf(1f, 1f, 1f, 1f)
-    private val colorCyan = floatArrayOf(0f, 1f, 1f, 1f)
+    // Couleurs
+    private val colorContour = floatArrayOf(0f, 1f, 0f, 1f)    // Vert (Forme brute)
+    private val colorRect = floatArrayOf(1f, 0f, 0f, 1f)       // Rouge (Rectangle corrigé)
+    private val colorFill = floatArrayOf(1f, 0f, 0f, 0.3f)     // Remplissage Rouge
 
+    // SHADERS
     private val vShaderCam = "attribute vec4 vPos; attribute vec2 vTex; varying vec2 fTex; void main(){gl_Position=vPos; fTex=vTex;}"
     private val fShaderCam = "#extension GL_OES_EGL_image_external : require\nprecision mediump float; varying vec2 fTex; uniform samplerExternalOES sTex; void main(){gl_FragColor=texture2D(sTex,fTex);}"
-    private val vShaderSimple = "uniform mat4 uMVP; attribute vec4 vPos; uniform float uPSize; void main(){gl_Position=uMVP*vPos; gl_PointSize=uPSize;}"
-    private val fShaderColor = "precision mediump float; uniform vec4 vCol; void main(){gl_FragColor=vCol;}"
+    private val vShaderSimple = "uniform mat4 uMVP; attribute vec4 vPos; void main(){gl_Position=uMVP*vPos;}"
+    private val fShaderSimple = "precision mediump float; uniform vec4 vCol; void main(){gl_FragColor=vCol;}"
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
         val tex = IntArray(1)
         GLES20.glGenTextures(1, tex, 0)
@@ -87,24 +73,18 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
         GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST.toFloat())
         currentSession?.setCameraTextureName(textureId)
 
-        quadVertices = makeBuffer(floatArrayOf(-1f, -1f, 0f, -1f, 1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f))
-        quadTexCoords = makeBuffer(floatArrayOf(0f, 1f, 0f, 0f, 1f, 1f, 1f, 0f))
-        crossBuffer = makeBuffer(crossVertices)
+        quadVertices = makeBuffer(floatArrayOf(-1f,-1f,0f, -1f,1f,0f, 1f,-1f,0f, 1f,1f,0f))
+        quadTexCoords = makeBuffer(floatArrayOf(0f,1f, 0f,0f, 1f,1f, 1f,0f))
 
         bgProgram = createProgram(vShaderCam, fShaderCam)
         bgPosHandle = GLES20.glGetAttribLocation(bgProgram, "vPos")
         bgTexHandle = GLES20.glGetAttribLocation(bgProgram, "vTex")
         bgTexUniform = GLES20.glGetUniformLocation(bgProgram, "sTex")
 
-        crossProgram = createProgram(vShaderSimple, fShaderColor)
-        crossPosHandle = GLES20.glGetAttribLocation(crossProgram, "vPos")
-        crossMVPHandle = GLES20.glGetUniformLocation(crossProgram, "uMVP")
-        crossColorHandle = GLES20.glGetUniformLocation(crossProgram, "vCol")
-        
-        pointProgram = createProgram(vShaderSimple, fShaderColor)
-        pointPosHandle = GLES20.glGetAttribLocation(pointProgram, "vPos")
-        pointMVPHandle = GLES20.glGetUniformLocation(pointProgram, "uMVP")
-        pointSizeHandle = GLES20.glGetUniformLocation(pointProgram, "uPSize")
+        standardProgram = createProgram(vShaderSimple, fShaderSimple)
+        posHandle = GLES20.glGetAttribLocation(standardProgram, "vPos")
+        mvpHandle = GLES20.glGetUniformLocation(standardProgram, "uMVP")
+        colorHandle = GLES20.glGetUniformLocation(standardProgram, "vCol")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -123,9 +103,9 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
             val frame = currentSession!!.update()
             val camera = frame.camera
 
-            handleTap(frame, camera)
-            
-            // 1. DESSIN CAMERA
+            findPlaneUnderCrosshair(frame)
+
+            // 1. CAMERA
             GLES20.glDisable(GLES20.GL_DEPTH_TEST)
             GLES20.glUseProgram(bgProgram)
             val uvs = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -139,185 +119,129 @@ class ARRenderer(val context: Context) : GLSurfaceView.Renderer {
             GLES20.glUniform1i(bgTexUniform, 0)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-            // CALCUL MATRICES CAMERA
             camera.getProjectionMatrix(projMtx, 0, 0.1f, 100f)
             camera.getViewMatrix(viewMtx, 0)
-            Matrix.multiplyMM(mvpMtx, 0, projMtx, 0, viewMtx, 0) // VP Matrix
-
-            // 2. POINTS JAUNES
-            GLES20.glUseProgram(pointProgram)
-            val pointCloud = frame.acquirePointCloud()
-            if (pointCloud.points != null) {
-                 GLES20.glUniformMatrix4fv(pointMVPHandle, 1, false, mvpMtx, 0)
-                 GLES20.glUniform1f(pointSizeHandle, 10.0f)
-                 GLES20.glUniform4fv(GLES20.glGetUniformLocation(pointProgram, "vCol"), 1, floatArrayOf(1f, 0.8f, 0f, 1f), 0)
-                 GLES20.glVertexAttribPointer(pointPosHandle, 4, GLES20.GL_FLOAT, false, 16, pointCloud.points)
-                 GLES20.glEnableVertexAttribArray(pointPosHandle)
-                 GLES20.glDrawArrays(GLES20.GL_POINTS, 0, pointCloud.points.remaining() / 4)
-            }
-            pointCloud.release()
-
-            // 3. ANCRES (CROIX) ET PREPARATION LABELS
-            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-            GLES20.glUseProgram(crossProgram)
             
-            // On vide la liste des labels pour cette frame
-            val newLabels = ArrayList<ARLabel>()
-            val letters = arrayOf("A", "B", "C", "D")
-
-            for ((index, anchor) in anchors.withIndex()) {
-                if (anchor.trackingState != TrackingState.TRACKING) continue
-                
-                // Dessin 3D
-                anchor.pose.toMatrix(modelMtx, 0)
-                Matrix.multiplyMM(finalMtx, 0, mvpMtx, 0, modelMtx, 0)
-                
-                GLES20.glUniformMatrix4fv(crossMVPHandle, 1, false, finalMtx, 0)
-                GLES20.glUniform4fv(crossColorHandle, 1, colorWhite, 0)
-                GLES20.glVertexAttribPointer(crossPosHandle, 3, GLES20.GL_FLOAT, false, 0, crossBuffer)
-                GLES20.glEnableVertexAttribArray(crossPosHandle)
-                GLES20.glLineWidth(5f)
-                GLES20.glDrawArrays(GLES20.GL_LINES, 0, 4)
-
-                // Calcul Position 2D pour le Label (Lettre)
-                val screenPos = worldToScreen(anchor.pose.tx(), anchor.pose.ty(), anchor.pose.tz(), mvpMtx)
-                if (screenPos != null) {
-                    val txt = if (index < 4) letters[index] else "?"
-                    newLabels.add(ARLabel(screenPos[0], screenPos[1], txt, 0))
-                }
+            // 2. DESSIN DE LA SURFACE AUTOMATIQUE
+            if (detectedPlane != null && detectedPlane!!.trackingState == TrackingState.TRACKING) {
+                drawDetectedPlane(detectedPlane!!)
+            } else {
+                 uiMessage = "Scannez le sol pour détecter une surface..."
             }
-            
-            // 4. LIGNES + LABELS LONGUEURS
-            if (anchors.size > 1) {
-                drawPolylineAndCalcLengths(newLabels)
-            }
-            
-            // Mise à jour Thread-Safe des labels pour l'UI
-            labelsToDraw.clear()
-            labelsToDraw.addAll(newLabels)
 
         } catch (e: Exception) { Log.e("RENDERER", "Err: " + e.message) }
     }
 
-    private fun drawPolylineAndCalcLengths(labelsList: ArrayList<ARLabel>) {
-        val coordsList = ArrayList<Float>()
-        val anchorList = ArrayList<Anchor>()
+    private fun findPlaneUnderCrosshair(frame: com.google.ar.core.Frame) {
+        if (viewportWidth == 0) return
         
-        for (a in anchors) {
-            if (a.trackingState == TrackingState.TRACKING) {
-                coordsList.add(a.pose.tx()); coordsList.add(a.pose.ty()); coordsList.add(a.pose.tz())
-                anchorList.add(a)
+        val hits = frame.hitTest(viewportWidth / 2f, viewportHeight / 2f)
+        var found = false
+        
+        for (hit in hits) {
+            val trackable = hit.trackable
+            if (trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)) {
+                detectedPlane = trackable
+                found = true
+                break
             }
         }
         
-        // Fermeture boucle
-        if (anchors.size == 4 && anchors[0].trackingState == TrackingState.TRACKING) {
-            val a0 = anchors[0]
-            coordsList.add(a0.pose.tx()); coordsList.add(a0.pose.ty()); coordsList.add(a0.pose.tz())
-            anchorList.add(a0)
+        if (!found) {
+            // Si on vise le vide, on n'efface pas la plane précédente pour ne pas faire clignoter
         }
+    }
 
-        if (coordsList.isEmpty()) return
+    private fun drawDetectedPlane(plane: Plane) {
+        val polygon = plane.polygon 
+        if (polygon == null || polygon.remaining() < 6) return
 
-        // Dessin Ligne
-        val lineVertices = FloatArray(coordsList.size)
-        for (i in coordsList.indices) lineVertices[i] = coordsList[i]
-        val lineBuff = makeBuffer(lineVertices)
+        plane.centerPose.toMatrix(planeModelMtx, 0)
+        Matrix.multiplyMM(mvpMtx, 0, viewMtx, 0, planeModelMtx, 0)
+        Matrix.multiplyMM(mvpMtx, 0, projMtx, 0, mvpMtx, 0)
+
+        val vertexCount = polygon.remaining() / 2
+        val rawCoords = FloatArray(vertexCount * 3)
         
-        GLES20.glUniformMatrix4fv(crossMVPHandle, 1, false, mvpMtx, 0)
-        GLES20.glUniform4fv(crossColorHandle, 1, colorCyan, 0)
-        GLES20.glVertexAttribPointer(crossPosHandle, 3, GLES20.GL_FLOAT, false, 0, lineBuff)
-        GLES20.glEnableVertexAttribArray(crossPosHandle)
+        var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
+        var minZ = Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+        
+        polygon.rewind()
+        var i = 0
+        while (polygon.hasRemaining()) {
+            val x = polygon.get()
+            val z = polygon.get()
+            
+            rawCoords[i*3] = x
+            rawCoords[i*3+1] = 0f 
+            rawCoords[i*3+2] = z
+            
+            minX = min(minX, x)
+            maxX = max(maxX, x)
+            minZ = min(minZ, z)
+            maxZ = max(maxZ, z)
+            
+            i++
+        }
+        
+        // 1. DESSIN CONTOUR BRUT (VERT)
+        val polyBuff = makeBuffer(rawCoords)
+        GLES20.glUseProgram(standardProgram)
+        GLES20.glUniformMatrix4fv(mvpHandle, 1, false, mvpMtx, 0)
+        GLES20.glUniform4fv(colorHandle, 1, colorContour, 0) 
+        GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, 0, polyBuff)
+        GLES20.glEnableVertexAttribArray(posHandle)
+        GLES20.glLineWidth(5f)
+        GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, vertexCount)
+
+        // 2. RECTANGLE ENGLOBANT (ROUGE)
+        val width = maxX - minX
+        val depth = maxZ - minZ
+        val area = width * depth
+        
+        val rectCoords = floatArrayOf(
+            minX, 0.01f, minZ,
+            maxX, 0.01f, minZ,
+            maxX, 0.01f, maxZ,
+            minX, 0.01f, maxZ
+        )
+        val rectBuff = makeBuffer(rectCoords)
+        
+        // Remplissage Rouge Transparent
+        GLES20.glUniform4fv(colorHandle, 1, colorFill, 0) 
+        GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, 0, rectBuff)
+        GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+        GLES20.glDisable(GLES20.GL_CULL_FACE)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_FAN, 0, 4)
+        
+        // Cadre Rouge
+        GLES20.glUniform4fv(colorHandle, 1, colorRect, 0)
         GLES20.glLineWidth(10f)
-        GLES20.glDrawArrays(GLES20.GL_LINE_STRIP, 0, lineVertices.size / 3)
+        GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 4)
+        
+        GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+        GLES20.glEnable(GLES20.GL_CULL_FACE)
 
-        // Calcul des Labels de Longueur (Milieu des segments)
-        for (i in 0 until anchorList.size - 1) {
-            val a1 = anchorList[i]
-            val a2 = anchorList[i+1]
-            
-            val dist = calculateDistance(a1, a2)
-            
-            // Position milieu 3D
-            val midX = (a1.pose.tx() + a2.pose.tx()) / 2
-            val midY = (a1.pose.ty() + a2.pose.ty()) / 2
-            val midZ = (a1.pose.tz() + a2.pose.tz()) / 2
-            
-            val screenPos = worldToScreen(midX, midY, midZ, mvpMtx)
-            if (screenPos != null) {
-                labelsList.add(ARLabel(screenPos[0], screenPos[1], "%.2fm".format(dist), 1))
-            }
+        updateInfo(width, depth, area)
+    }
+
+    private fun updateInfo(w: Float, h: Float, area: Float) {
+        val text = StringBuilder()
+        text.append("DETECTION AUTO\n")
+        text.append("----------------\n")
+        text.append("Largeur : %.2f m\n".format(w))
+        text.append("Long.   : %.2f m\n".format(h))
+        text.append("\nSURFACE : %.2f m²".format(area))
+        
+        if (abs(area - lastArea) > 0.05f) { 
+            uiMessage = text.toString()
+            lastArea = area
         }
     }
-    
-    // MATHEMATIQUES : Projection 3D -> 2D
-    private fun worldToScreen(x: Float, y: Float, z: Float, mvp: FloatArray): FloatArray? {
-        val res = FloatArray(4)
-        // Multiplication Vecteur (x,y,z,1) par Matrice MVP
-        Matrix.multiplyMV(res, 0, mvp, 0, floatArrayOf(x, y, z, 1f), 0)
-        
-        // Si w < 0, le point est derrière la caméra
-        if (res[3] <= 0) return null
-        
-        // Normalisation (-1 à 1)
-        val ndcX = res[0] / res[3]
-        val ndcY = res[1] / res[3]
-        
-        // Mapping vers l'écran (0 à width, 0 à height)
-        val screenX = (ndcX + 1) / 2 * viewportWidth
-        val screenY = (1 - ndcY) / 2 * viewportHeight // Attention, Y inversé en GL ?
-        // Android Canvas Y=0 en haut, GL Y=0 en bas.
-        // On renvoie coord Android (Y inversé par rapport à GL)
-        return floatArrayOf(screenX, viewportHeight - screenY)
-    }
+    private var lastArea = 0f
 
-    private fun handleTap(frame: com.google.ar.core.Frame, camera: com.google.ar.core.Camera) {
-        if (shouldCapture && viewportWidth > 0) {
-            if (anchors.size >= 4) {
-                anchors.forEach { it.detach() }
-                anchors.clear()
-                uiMessage = "🗑️ Reset. Placez Point A."
-            }
-            val hits = frame.hitTest(viewportWidth / 2f, viewportHeight / 2f)
-            for (hit in hits) {
-                val trackable = hit.trackable
-                if ((trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)) ||
-                    (trackable is com.google.ar.core.Point) ||
-                    (trackable is InstantPlacementPoint)) {
-                    
-                    anchors.add(hit.createAnchor())
-                    if (anchors.size < 3) uiMessage = "Point ${anchors.size} placé."
-                    else if (anchors.size == 3) uiMessage = "Triangle: %.2f m²".format(calculateTriangleArea(anchors[0], anchors[1], anchors[2]))
-                    else if (anchors.size == 4) {
-                        val t1 = calculateTriangleArea(anchors[0], anchors[1], anchors[2])
-                        val t2 = calculateTriangleArea(anchors[0], anchors[2], anchors[3])
-                        uiMessage = "🟦 SURFACE : %.2f m²".format(t1 + t2)
-                        lastInfo = uiMessage
-                    }
-                    break
-                }
-            }
-            shouldCapture = false
-        }
-        if (anchors.size >= 4) uiMessage = lastInfo
-        else if (anchors.isEmpty() && uiMessage.contains("m²")) uiMessage = "🎯 Visez et Cliquez"
-    }
+    fun triggerCapture() { /* Non utilisé en mode Auto */ }
 
-    private fun calculateDistance(a1: Anchor, a2: Anchor): Float {
-        val dx = a1.pose.tx() - a2.pose.tx()
-        val dy = a1.pose.ty() - a2.pose.ty()
-        val dz = a1.pose.tz() - a2.pose.tz()
-        return sqrt(dx*dx + dy*dy + dz*dz)
-    }
-
-    private fun calculateTriangleArea(p0: Anchor, p1: Anchor, p2: Anchor): Float {
-        val abX = p1.pose.tx() - p0.pose.tx(); val abY = p1.pose.ty() - p0.pose.ty(); val abZ = p1.pose.tz() - p0.pose.tz()
-        val acX = p2.pose.tx() - p0.pose.tx(); val acY = p2.pose.ty() - p0.pose.ty(); val acZ = p2.pose.tz() - p0.pose.tz()
-        val cpX = abY * acZ - abZ * acY; val cpY = abZ * acX - abX * acZ; val cpZ = abX * acY - abY * acX
-        return sqrt(cpX*cpX + cpY*cpY + cpZ*cpZ) / 2.0f
-    }
-
-    fun triggerCapture() { shouldCapture = true }
     private fun makeBuffer(arr: FloatArray): FloatBuffer {
         val bb = ByteBuffer.allocateDirect(arr.size * 4).order(ByteOrder.nativeOrder())
         return bb.asFloatBuffer().put(arr).apply { position(0) }
